@@ -1,0 +1,24 @@
+# ---------------------------------------------------------------------------
+# PATIENT DATA - NEVER COMMIT
+# ---------------------------------------------------------------------------
+# The export contains dates of birth, admission/discharge timestamps and a
+# patient number whose first six digits are the date of birth. That is
+# directly identifying personal data (GDPR art. 4/9): it must stay on the
+# hospital drive and out of this repository.
+data-raw/
+*.xlsx
+*.xls
+*.csv
+*.sav
+*.dta
+
+# Results: aggregate tables are safe, but analysis_dataset.rds holds one row
+# per patient with identifiers, so the whole folder is excluded.
+output/
+
+# R / RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
