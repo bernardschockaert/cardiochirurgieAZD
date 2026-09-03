@@ -191,6 +191,56 @@ Override with e.g. `FORCE_SUMMARY <- c(age_years = "mean_sd")`.
 `STRATIFY_BY <- "surg_group"` adds a stratified Table 1 with p-values
 (Kruskal–Wallis or ANOVA; χ², Fisher when expected counts < 5).
 
+---
+
+## `Slides_overview.R` — two-slide PowerPoint
+
+```r
+source("Cardiochirurgie.R")    # once, to build the derived dataset
+source("Slides_overview.R")    # -> output/Cardiochirurgie_overview.pptx
+```
+
+Needs only `officer`. It re-uses `d` if it is already in the session, otherwise
+reads `output/analysis_dataset.rds`, otherwise runs the analysis script itself.
+
+* **Slide 1 — the cohort.** Hero band with the headline count, a five-figure KPI
+  strip, type of surgery, age distribution, comorbidity and a baseline table.
+* **Slide 2 — early recovery.** The care pathway from theatre to ICU discharge,
+  four headline indicators, the cumulative share extubated by time since end of
+  surgery, mortality and AKI stage.
+
+Every number is read from the data — nothing is typed in, so the deck is correct
+by construction and re-running it after a data update refreshes both slides.
+
+**Everything is a native PowerPoint shape**, not a picture: each rectangle, line
+and word stays selectable and editable, the file is ~31 kB, and it stays crisp
+at any zoom or print size. The trade-off is that the drawing is done by hand in
+DrawingML rather than by a charting package, so a new chart type means a new
+helper in section 2 (`el_hbars`, `el_vbars`, `el_table`, `el_step` are the ones
+that exist).
+
+Two implementation notes worth knowing if you edit it:
+
+* officer 0.6.x cannot set the slide size and its template is 4:3, so the script
+  rewrites `<p:sldSz>` inside the package to get 16:9 and then **reads the size
+  back** and lays out from that — if the resize is ever refused the slides still
+  fit the page instead of running off it. Repacking must use `zip::zipr()`;
+  `zip::zip(mode = "cherry-pick")` flattens the directory structure and produces
+  a file PowerPoint cannot open.
+* The source is pure ASCII, with accented Dutch written as `\uXXXX` escapes, and
+  the generated XML escapes every non-ASCII character as a numeric reference.
+  That is deliberate: RStudio on Windows often runs in a non-UTF-8 locale, and
+  without it "geëxtubeerd" and "patiënten" corrupt the file.
+
+Change the look in the CONFIG block: `FONT` (default "Segoe UI") and the
+palette constants. Slide text is Dutch; it is all in the `slide1` / `slide2`
+blocks in sections 5 and 6.
+
+The example report also carried a benchmark column (AZ Delta vs reference
+ranges). That is deliberately **not** included — the reference ranges would have
+to be quoted from a source rather than invented. Tell me which guideline values
+you want to compare against and it is a short addition.
+
 To change the procedure classification, edit `RX_CABG` / `RX_VALVE` in
 section 3.5. To add a variable to Table 1, add one `sp(...)` line to
 `TABLE1_SPEC`.

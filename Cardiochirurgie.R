@@ -1141,3 +1141,5 @@ cat(" written: ", file.path(OUT_DIR, "analysis_dataset.rds"),
 
 hdr("DONE")
 cat("Session: ", R.version.string, " | ", format(Sys.time(), "%Y-%m-%d %H:%M"), "\n", sep = "")
+if (file.exists("Slides_overview.R"))
+  cat("\nFor the two-slide PowerPoint overview:  source(\"Slides_overview.R\")\n")
