@@ -320,9 +320,13 @@ K <- list(
   cva        = pc(d$prior_cva_tia),
   lung       = pc(d$lung_disease),
   mort_icu   = pc(d$death_icu),
+  mort_hosp  = pc(d$death_hospital),
   mort_30    = pc(d$death_30d),
   mort_180   = pc(d$death_180d),
   aki_any    = pc(d$aki_any),
+  dialysis   = pc(d$dialysis_postop),
+  plos_med   = med(d$postop_los_days),
+  plos_iqr   = iqr(d$postop_los_days, 1),
   extub_6h   = pc(!d$vent_gt6h),
   on_table   = pc(d$extub_status == "Extubated on table"),
   vent_med   = med(d$vent_min_recorded[d$extub_status == "Ventilated on ICU"]) / 60,
@@ -486,7 +490,7 @@ slide1 <- c(slide1,
 ## ---- footer -----------------------------------------------------------------
 slide1 <- c(slide1,
   list(sp_txt(M, 7.20, SLIDE_W - 2 * M - 1.2, 0.24, list(para(run(sprintf(
-    "%s IZ-opnames bij %s pati\u00ebnten, %s. Percentages zijn berekend op de geregistreerde waarden.",
+    "%s IZ-opnames bij %s pati\u00ebnten, %s. TAVI uitgesloten. Percentages op de geregistreerde waarden.",
     nl_int(K$n_rec), nl_int(K$n_pat), K$period), 7.6, MUTED))))),
   list(sp_txt(SLIDE_W - M - 1.2, 7.20, 1.2, 0.24,
               list(para(run("01", 8, SLATE3, bold = TRUE), align = "r")))))
@@ -514,14 +518,16 @@ slide2 <- c(
 steps <- list(
   list("Operatiekwartier", "Hemodynamische sturing en peroperatieve monitoring",
        sprintf("%s u ingreep", nl_num(K$surg_dur, 1))),
-  list("Extubatie", "Gecontroleerde opwaking, extubatie meestal binnen zes uur",
+  list("Extubatie", "Gecontroleerde opwaking en extubatie",
        sprintf("%s \u2264 6 u", nl_pct(K$extub_6h, 0))),
   list("Cardiale IZ", "Bewaking, pijnstilling en drainverwijdering",
        sprintf("%s d mediaan", nl_num(K$los_med, 1))),
   list("Mobilisatie", "Eerste keer rechtop in de zetel",
        sprintf("%s u tot zetel", nl_num(K$chair_med, 0))),
   list("Ontslag IZ", "Naar medium care of verpleegafdeling",
-       sprintf("%s heropname", nl_pct(K$readm, 1)))
+       sprintf("%s heropname", nl_pct(K$readm, 1))),
+  list("Ontslag ziekenhuis", "Naar huis of naar een ander ziekenhuis",
+       sprintf("%s d na ingreep", nl_num(K$plos_med, 1)))
 )
 sw <- (SLIDE_W - 2 * M) / length(steps)
 cy <- 1.42; cd <- 0.44
@@ -546,8 +552,9 @@ for (i in seq_along(steps)) {
 cards <- list(
   list(nl_pct(K$extub_6h, 0), "Ge\u00ebxtubeerd \u2264 6 u", sprintf("%s al op tafel", nl_pct(K$on_table, 0))),
   list(paste0(nl_num(K$los_med, 1), " d"), "Mediaan IZ-verblijf", sprintf("IQR %s d", K$los_iqr)),
-  list(nl_pct(K$readm, 1), "Heropname op IZ", "binnen dezelfde opname"),
-  list(nl_pct(K$aki_any, 1), "AKI, elk stadium", "creatinine-criterium")
+  list(paste0(nl_num(K$plos_med, 1), " d"), "Postop. ziekenhuisverblijf",
+       sprintf("IQR %s d", K$plos_iqr)),
+  list(nl_pct(K$aki_any, 1), "AKI, elk stadium", sprintf("dialyse %s", nl_pct(K$dialysis, 1)))
 )
 cwd <- (SLIDE_W - 2 * M - 3 * 0.24) / 4
 for (i in seq_along(cards)) {
@@ -593,27 +600,27 @@ slide2 <- c(slide2,
 ## ---- right: outcomes ----------------------------------------------------------
 RX <- PX + PW + 0.75; RW <- SLIDE_W - M - RX
 slide2 <- c(slide2,
-  el_heading(RX, 4.34, "Mortaliteit", RW),
-  el_hbars(RX, 4.74, RW,
-           values = c(K$mort_icu, K$mort_30, K$mort_180),
-           labels = c("Op IZ", "30 dagen", "180 dagen"),
-           fills  = c(SLATE, SLATE2, SLATE3),
-           label_w = 1.30, row_h = 0.30, gap = 0.02,
+  el_heading(RX, 4.30, "Mortaliteit", RW),
+  el_hbars(RX, 4.62, RW,
+           values = c(K$mort_icu, K$mort_hosp, K$mort_30, K$mort_180),
+           labels = c("Op IZ", "In-hospitaal", "30 dagen", "180 dagen"),
+           fills  = c(SLATE, SLATE2, SLATE2, SLATE3),
+           label_w = 1.30, row_h = 0.24, gap = 0.015,
            max_val = K$mort_180 * 1.2),
-  el_heading(RX, 5.86, "AKI-stadium (creatinine)", RW),
-  el_hbars(RX, 6.24, RW,
-           values = K$aki_dist[2:4],
-           labels = c("Stadium 1", "Stadium 2", "Stadium 3"),
-           fills  = c(SLATE3, SLATE2, SLATE),
-           label_w = 1.30, row_h = 0.30, gap = 0.02,
+  el_heading(RX, 5.70, "AKI-stadium en dialyse", RW),
+  el_hbars(RX, 6.04, RW,
+           values = c(K$aki_dist[2:4], K$dialysis),
+           labels = c("Stadium 1", "Stadium 2", "Stadium 3", "Dialyse"),
+           fills  = c(SLATE3, SLATE2, SLATE, NAVY),
+           label_w = 1.30, row_h = 0.24, gap = 0.015,
            max_val = K$aki_dist[2] * 1.2))
 
 ## ---- footer -------------------------------------------------------------------
 slide2 <- c(slide2,
   list(sp_txt(M, 7.20, SLIDE_W - 2 * M - 1.2, 0.24, list(para(run(sprintf(
-    paste("AKI op het creatinine-criterium alleen (%s beoordeelbaar); urineproductie en",
-          "nierfunctievervanging ontbreken in de export, de cijfers zijn een ondergrens."),
-    nl_int(sum(!is.na(d$aki_stage)))), 7.6, MUTED))))),
+    paste("AKI t.o.v. de laagste creatinine in de 3 maanden voor de ingreep (%s beoordeelbaar);",
+          "postoperatieve dialyse telt als stadium 3. TAVI uitgesloten."),
+    nl_int(sum(!is.na(d$aki_stage)))), 7.4, MUTED))))),
   list(sp_txt(SLIDE_W - M - 1.2, 7.20, 1.2, 0.24,
               list(para(run("02", 8, SLATE3, bold = TRUE), align = "r")))))
 

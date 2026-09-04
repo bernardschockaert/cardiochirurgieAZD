@@ -31,17 +31,22 @@
 # 0.  CONFIGURATION -- read this block before running
 # =============================================================================
 
-DATA_FILE <- "data-raw/iz_cardio_versie_28082026.xlsx"
+DATA_FILE <- "data-raw/iz_cardio_versie_04092026.xlsx"
 SHEET     <- 1
 OUT_DIR   <- "output"
 
 ## --- Analysis population -----------------------------------------------------
-## The file holds 1892 records for 1869 patients: 23 patients have >1 record
+## The file holds 2066 records for 2037 patients: 29 patients have >1 record
 ## (re-operations / a second ICU episode, e.g. "Revisie", "Thoraxdrain",
 ## "Pericardfenestratie").  Choose the unit of analysis:
-##   "all_records"       - every ICU admission (n = 1892)   [as delivered]
-##   "first_per_patient" - index procedure only (n = 1869)  [cleaner Table 1]
+##   "all_records"       - every ICU admission                [as delivered]
+##   "first_per_patient" - index procedure only               [cleaner Table 1]
 ANALYSIS_UNIT <- "all_records"
+
+## TAVI is a transcatheter, not a surgical, procedure and is excluded from the
+## analysis population (31 records).  The count of excluded records is reported
+## in the data quality table.
+EXCLUDE_TAVI <- TRUE
 
 ## --- Elective vs non-elective ------------------------------------------------
 ## 'urgentie_graad' is blank in 1181/1892 (62.4%).  Observed outcome gradient:
@@ -76,13 +81,23 @@ DAVID_AS_VALVE <- FALSE
 DM_MISSING_AS_NONE <- FALSE
 
 ## --- AKI ---------------------------------------------------------------------
-## Stage from max_creatinine vs creatinine_dag_voor_operatie (as requested):
-##   stage 1 : rise >= AKI_ABS_RISE  OR  ratio 1.5-1.9      (and ratio < 2)
+## Reference creatinine = the LOWEST value in the 3 months before surgery
+## (laagste_creatinine_3m_voor_operatie), which is the KDIGO baseline; the
+## day-before-surgery value is kept for a sensitivity analysis.
+##   "lowest_3m"    - laagste_creatinine_3m_voor_operatie     [default]
+##   "day_before"   - creatinine_dag_voor_operatie
+AKI_BASELINE <- "lowest_3m"
+
+## Staging against that baseline:
+##   any AKI : rise >= AKI_ABS_RISE  OR  ratio >= 1.5
+##   stage 1 : rise >= AKI_ABS_RISE  OR  ratio 1.5-1.9       (and ratio < 2)
 ##   stage 2 : ratio 2.0 - 2.9
-##   stage 3 : ratio >= 3.0
+##   stage 3 : ratio >= 3.0  OR  post-operative dialysis (KDIGO renal
+##             replacement criterion, from Dialyse_postop)
 ## Creatinine unit is auto-detected; AKI_ABS_RISE is set to 0.3 mg/dL or
 ## 26.5 umol/L accordingly.  Set AKI_ABS_RISE manually to override.
-AKI_ABS_RISE <- NA   # NA = auto
+AKI_ABS_RISE      <- NA     # NA = auto
+AKI_DIALYSIS_IS_3 <- TRUE   # count post-operative dialysis as stage 3
 
 ## KDIGO also requires the rise to happen inside a time window.  Only the DATE
 ## of max_creatinine is available, so this is a day-resolution sensitivity
@@ -279,6 +294,8 @@ COL_PATTERNS <- c(
   dob           = "^Geboortedatum$",
   icu_in        = "^Opname.?Datetime$",
   icu_out       = "^Ontslag.?Datetime$",
+  hosp_out      = "^Ontslag opname$",
+  disch_dest    = "^Ontslag bestemming$",
   surg_start    = "^surgery_start_datetime$",
   surg_end      = "^surgery_end_datetime$",
   urgency       = "^urgentie_graad$",
@@ -300,8 +317,10 @@ COL_PATTERNS <- c(
   vent_min      = "^duur_invbead_minuten$",
   vent_event    = "^duur_invbead_event$",
   crea_pre      = "^creatinine_dag_voor_operatie$",
+  crea_3m       = "^laagste_creatinine_3m_voor_operatie$",
   crea_max      = "^max_creatinine$",
   crea_max_date = "^datum_max_creatinine$",
+  dialysis      = "^Dialyse_postop$",
   mortality     = "^mortaliteit$",
   time_to_chair = "^tijd_tot_zetel_minuten$",
   vas24         = "^mean_VAS_24h$",
@@ -313,8 +332,12 @@ COL_PATTERNS <- c(
   iabp_days     = "^IABP \\(dagen\\)$"
 )
 ## Optional columns: absent = feature silently skipped, script still runs.
+## Optional columns: absent = that feature is skipped, the script still runs.
+## The four added in the 04/09/2026 export (hosp_out, disch_dest, crea_3m,
+## dialysis) are listed here so the script also runs on an older file.
 OPTIONAL <- c("los_caldays", "vent_event", "cpb_min", "xclamp_min", "approach",
-              "endocarditis", "ecmo_days", "impella_days", "iabp_days")
+              "endocarditis", "ecmo_days", "impella_days", "iabp_days",
+              "hosp_out", "disch_dest", "crea_3m", "dialysis")
 
 COLMAP <- vapply(names(COL_PATTERNS), function(k)
   resolve_col(raw, COL_PATTERNS[[k]], required = !(k %in% OPTIONAL), label = k),
@@ -483,34 +506,64 @@ if (!is.na(COLMAP[["xclamp_min"]])) d$xclamp_min <- as.numeric(g("xclamp_min"))
 
 ## --- 3.6  Mortality ----------------------------------------------------------
 ## 'mortaliteit' holds ONE mutually exclusive label per patient; blank = alive.
-##   overleden_IZ      -> died on the ICU
-##   30D mortaliteit   -> died <=30 d, after ICU discharge  (i.e. NOT on the ICU)
-##   180D mortaliteit  -> died 31-180 d
+##   overleden_IZ        -> died on the ICU
+##   overleden_hospitaal -> died in hospital, after ICU discharge
+##   30D mortaliteit     -> died <=30 d, after hospital discharge
+##   180D mortaliteit    -> died 31-180 d
+## The first two together are the in-hospital deaths, and they reproduce
+## 'Ontslag bestemming' == "8 Overleden" exactly (verified in the QC table).
 mo <- trimws(as.character(g("mortality")))
 d$mort_cat <- factor("Alive at 180 days",
-  levels = c("Alive at 180 days", "ICU death",
-             "Death <=30 days (after ICU discharge)", "Death 31-180 days"))
-d$mort_cat[grepl("overleden_?IZ", mo, ignore.case = TRUE)] <- "ICU death"
-d$mort_cat[grepl("^30D",  mo, ignore.case = TRUE)] <- "Death <=30 days (after ICU discharge)"
+  levels = c("Alive at 180 days", "ICU death", "In-hospital death (after ICU)",
+             "Death <=30 days (after discharge)", "Death 31-180 days"))
+d$mort_cat[grepl("overleden_?IZ", mo, ignore.case = TRUE)]         <- "ICU death"
+d$mort_cat[grepl("overleden_?hosp", mo, ignore.case = TRUE)]       <- "In-hospital death (after ICU)"
+d$mort_cat[grepl("^30D",  mo, ignore.case = TRUE)] <- "Death <=30 days (after discharge)"
 d$mort_cat[grepl("^180D", mo, ignore.case = TRUE)] <- "Death 31-180 days"
 
-d$death_icu  <- d$mort_cat == "ICU death"
-## Cumulative figures assume every ICU death occurred within 30 days of surgery
-## (true unless a patient died on the ICU after day 30 - check with QC below).
-d$death_30d  <- d$mort_cat %in% c("ICU death", "Death <=30 days (after ICU discharge)")
+d$death_icu      <- d$mort_cat == "ICU death"
+d$death_hospital <- d$mort_cat %in% c("ICU death", "In-hospital death (after ICU)")
+## Cumulative figures assume every in-hospital death occurred within 30 days of
+## surgery (checked in the QC table - a long ICU stay can break it).
+d$death_30d  <- d$mort_cat %in% c("ICU death", "In-hospital death (after ICU)",
+                                  "Death <=30 days (after discharge)")
 d$death_180d <- d$mort_cat != "Alive at 180 days"
 
+## Discharge destination, and the independent check on in-hospital mortality.
+if (!is.na(COLMAP[["disch_dest"]])) {
+  dd <- trimws(as.character(g("disch_dest")))
+  d$discharge_dest <- factor(sub("^[0-9]+\\s+", "", dd))
+  d$dest_died      <- grepl("overleden", dd, ignore.case = TRUE)
+}
+
 ## --- 3.7  Acute kidney injury ------------------------------------------------
-d$crea_pre <- as.numeric(g("crea_pre"))
+d$crea_pre <- as.numeric(g("crea_pre"))          # day before surgery
+d$crea_3m  <- if (!is.na(COLMAP[["crea_3m"]])) as.numeric(g("crea_3m")) else NA_real_
 d$crea_max <- as.numeric(g("crea_max"))
+d$dialysis_postop <- if (!is.na(COLMAP[["dialysis"]])) present(g("dialysis")) else FALSE
+
+## Reference creatinine: the lowest value in the 3 months before surgery when it
+## is available, otherwise the day-before value.
+if (AKI_BASELINE == "lowest_3m" && all(is.na(d$crea_3m))) {
+  warning("laagste_creatinine_3m_voor_operatie not in this file; ",
+          "falling back to creatinine_dag_voor_operatie as the AKI baseline.",
+          call. = FALSE)
+  AKI_BASELINE <- "day_before"
+}
+d$crea_base <- if (AKI_BASELINE == "lowest_3m") d$crea_3m else d$crea_pre
+
 CREA_UNIT <- if (median(d$crea_max, na.rm = TRUE) > 30) "umol/L" else "mg/dL"
 ABS_RISE  <- if (is.finite(AKI_ABS_RISE)) AKI_ABS_RISE else
              if (CREA_UNIT == "umol/L") 26.5 else 0.3
 cat(sprintf("\nCreatinine unit detected: %s  ->  absolute-rise threshold = %.4g %s\n",
             CREA_UNIT, ABS_RISE, CREA_UNIT))
+cat(sprintf("AKI reference creatinine: %s\n",
+            if (AKI_BASELINE == "lowest_3m")
+              "lowest value in the 3 months before surgery" else
+              "value on the day before surgery"))
 
-d$crea_ratio <- d$crea_max / d$crea_pre
-d$crea_delta <- d$crea_max - d$crea_pre
+d$crea_ratio <- d$crea_max / d$crea_base
+d$crea_delta <- d$crea_max - d$crea_base
 ok <- is.finite(d$crea_ratio) & is.finite(d$crea_delta)
 
 stage <- rep(NA_integer_, nrow(d))
@@ -518,9 +571,23 @@ stage[ok] <- 0L
 stage[ok & (d$crea_ratio >= 1.5 | d$crea_delta >= ABS_RISE)] <- 1L
 stage[ok &  d$crea_ratio >= 2   & d$crea_ratio < 3]          <- 2L
 stage[ok &  d$crea_ratio >= 3]                               <- 3L
+## KDIGO renal-replacement criterion: dialysis is stage 3 whatever the
+## creatinine did, and it also makes AKI assessable when a value is missing.
+if (AKI_DIALYSIS_IS_3) stage[d$dialysis_postop] <- 3L
 d$aki_stage <- factor(stage, levels = 0:3,
                       labels = c("No AKI", "AKI stage 1", "AKI stage 2", "AKI stage 3"))
 d$aki_any <- ifelse(is.na(stage), NA, stage > 0)
+
+## Same staging against the day-before-surgery creatinine, for comparison.
+r2 <- d$crea_max / d$crea_pre; dl2 <- d$crea_max - d$crea_pre
+ok2 <- is.finite(r2) & is.finite(dl2)
+s2 <- rep(NA_integer_, nrow(d)); s2[ok2] <- 0L
+s2[ok2 & (r2 >= 1.5 | dl2 >= ABS_RISE)] <- 1L
+s2[ok2 & r2 >= 2 & r2 < 3]              <- 2L
+s2[ok2 & r2 >= 3]                       <- 3L
+if (AKI_DIALYSIS_IS_3) s2[d$dialysis_postop] <- 3L
+d$aki_stage_daybefore <- factor(s2, levels = 0:3,
+  labels = c("No AKI", "AKI stage 1", "AKI stage 2", "AKI stage 3"))
 
 ## Time-windowed sensitivity analysis (only the DATE of the peak is available).
 d$crea_max_lag_days <- as.numeric(as.Date(g("crea_max_date")) - as.Date(d$surg_end))
@@ -531,6 +598,7 @@ stage_w[ok] <- 0L
 stage_w[ok & ((in_rat & d$crea_ratio >= 1.5) | (in_abs & d$crea_delta >= ABS_RISE))] <- 1L
 stage_w[ok & in_rat & d$crea_ratio >= 2 & d$crea_ratio < 3] <- 2L
 stage_w[ok & in_rat & d$crea_ratio >= 3]                    <- 3L
+if (AKI_DIALYSIS_IS_3) stage_w[d$dialysis_postop] <- 3L
 d$aki_stage_windowed <- factor(stage_w, levels = 0:3,
   labels = c("No AKI", "AKI stage 1", "AKI stage 2", "AKI stage 3"))
 
@@ -582,13 +650,26 @@ d$pcia <- factor(ifelse(present(g("pcia")), "PCIA", "No PCIA"),
                  levels = c("No PCIA", "PCIA"))
 
 ## --- 3.11  Length of stay and mobilisation -----------------------------------
-## 'Ligduur' equals Ontslag - Opname exactly, and Opname falls a median of 7 min
+## 'Ligduur' equals Ontslag - Opname exactly, and Opname falls a median of 5 min
 ## after the end of surgery => this is the ICU / post-operative unit stay.
-## A HOSPITAL length of stay is NOT present in this export (see QC report).
 d$icu_los_days  <- as.numeric(g("los_raw"))
 d$icu_los_check <- as.numeric(difftime(d$icu_out, d$icu_in, units = "days"))
 if (!is.na(COLMAP[["los_caldays"]])) d$icu_los_caldays <- as.numeric(g("los_caldays"))
-d$hosp_los_days <- NA_real_          # <- fill in if a hospital LOS is added
+
+## 'Ontslag opname' is the discharge of the hospital admission (it is never
+## before the ICU discharge).  There is still no hospital ADMISSION date, so
+## what can be measured is the POST-OPERATIVE hospital stay - which is the
+## usual ERAS endpoint anyway - plus the ward stay after leaving the ICU.
+if (!is.na(COLMAP[["hosp_out"]])) {
+  d$hosp_out       <- as.POSIXct(g("hosp_out"))
+  d$postop_los_days <- as.numeric(difftime(d$hosp_out, d$surg_end, units = "days"))
+  d$ward_los_days   <- as.numeric(difftime(d$hosp_out, d$icu_out,  units = "days"))
+  d$postop_los_days[d$postop_los_days < 0] <- NA   # a handful of stamp errors
+  d$ward_los_days[d$ward_los_days     < 0] <- NA
+} else {
+  d$postop_los_days <- NA_real_
+  d$ward_los_days   <- NA_real_
+}
 
 d$time_to_chair_min <- as.numeric(g("time_to_chair"))
 d$time_to_chair_h   <- d$time_to_chair_min / 60
@@ -601,9 +682,15 @@ if (length(mcs_cols))
   d$mcs_any <- Reduce(`|`, lapply(mcs_cols, function(k) as.numeric(g(k)) > 0))
 
 ## --- 3.13  Analysis population ----------------------------------------------
-d_all <- d
+d_all  <- d                                    # everything, before exclusions
+N_TAVI <- sum(d$has_tavi)
+if (EXCLUDE_TAVI) d <- d[!d$has_tavi, ]        # transcatheter, not surgical
 if (identical(ANALYSIS_UNIT, "first_per_patient")) d <- d[d$is_first_episode, ]
-cat(sprintf("\nAnalysis unit: %s  ->  n = %d records (%d unique patients)\n",
+d$surg_group   <- droplevels(d$surg_group)
+d$other_detail <- droplevels(d$other_detail)
+cat(sprintf("\nRecords in file : %d\n", nrow(d_all)))
+if (EXCLUDE_TAVI) cat(sprintf("TAVI excluded   : %d\n", N_TAVI))
+cat(sprintf("Analysis unit   : %s  ->  n = %d records (%d unique patients)\n",
             ANALYSIS_UNIT, nrow(d), length(unique(d$pat_id))))
 
 
@@ -638,8 +725,13 @@ QC <- rbind(
   qc("Ligduur equals Ontslag - Opname",
      ifelse(max(abs(d$icu_los_days - d$icu_los_check), na.rm = TRUE) < 1e-6, "yes", "NO"),
      "=> Ligduur is the ICU / post-operative unit stay, not the hospital stay"),
-  qc("Hospital length of stay available", "NO",
-     "no hospital admission/discharge column in this export - see notes"),
+  qc("Hospital discharge available ('Ontslag opname')",
+     ifelse(is.na(COLMAP[["hosp_out"]]), "NO", "yes"),
+     "post-operative hospital stay can be measured; hospital ADMISSION is still absent"),
+  qc("Hospital discharge before ICU discharge",
+     sum(d$hosp_out < d$icu_out, na.rm = TRUE), "should be 0"),
+  qc("Hospital discharge before end of surgery",
+     sum(!is.na(d$hosp_out) & d$hosp_out < d$surg_end), "set to missing"),
   qc("Ventilation time longer than ICU stay",
      sum(d$vent_min_all > as.numeric(difftime(d$icu_out, d$icu_in, units = "mins")), na.rm = TRUE)),
   qc("Time to chair longer than ICU stay",
@@ -647,14 +739,36 @@ QC <- rbind(
   qc("ICU stay < 60 min", sum(d$icu_los_days * 1440 < 60, na.rm = TRUE)),
 
   qc("--- Mortality ---", ""),
-  qc("ICU deaths with ICU stay > 30 days", sum(d$death_icu & d$icu_los_days > 30, na.rm = TRUE),
+  qc("In-hospital deaths ('mortaliteit')", sum(d$death_hospital)),
+  qc("Discharge destination = 'Overleden'",
+     if (is.null(d$dest_died)) "column absent" else sum(d$dest_died),
+     "independent check: should equal the in-hospital deaths above"),
+  qc("   the two agree",
+     if (is.null(d$dest_died)) "-" else
+       ifelse(all(d$dest_died == d$death_hospital), "yes",
+              sprintf("NO - %d discordant", sum(d$dest_died != d$death_hospital)))),
+  qc("In-hospital deaths with a stay > 30 days",
+     sum(d$death_hospital & d$icu_los_days > 30, na.rm = TRUE),
      "if > 0 the cumulative 30-day figure is an over-estimate"),
 
   qc("--- Creatinine / AKI ---", ""),
   qc("Creatinine unit detected", CREA_UNIT, sprintf("absolute-rise threshold %.4g", ABS_RISE)),
-  qc("Pre-operative creatinine missing",
-     sprintf("%d (%.1f%%)", sum(is.na(d$crea_pre)), 100 * mean(is.na(d$crea_pre))),
-     "AKI cannot be staged in these records"),
+  qc("AKI reference creatinine", AKI_BASELINE,
+     "lowest_3m = laagste_creatinine_3m_voor_operatie"),
+  qc("Reference creatinine missing",
+     sprintf("%d (%.1f%%)", sum(is.na(d$crea_base)), 100 * mean(is.na(d$crea_base))),
+     "AKI cannot be staged from creatinine in these records"),
+  qc("Lowest-3-month value <= day-before value",
+     { b <- !is.na(d$crea_3m) & !is.na(d$crea_pre)
+       if (!any(b)) "-" else sprintf("%d / %d", sum(d$crea_3m[b] <= d$crea_pre[b]), sum(b)) },
+     "sanity check on the new reference column"),
+  qc("Post-operative dialysis", sum(d$dialysis_postop),
+     sprintf("counted as AKI stage 3: %s", AKI_DIALYSIS_IS_3)),
+  qc("   of which not stage 3 on creatinine alone",
+     sum(d$dialysis_postop & (is.na(d$crea_ratio) | d$crea_ratio < 3)),
+     "these are only captured because dialysis is now recorded"),
+  qc("Day-before creatinine missing",
+     sprintf("%d (%.1f%%)", sum(is.na(d$crea_pre)), 100 * mean(is.na(d$crea_pre)))),
   qc("Peak creatinine missing", sum(is.na(d$crea_max))),
   qc("Peak creatinine BELOW pre-operative value",
      sum(d$crea_ratio < 1, na.rm = TRUE), "post-operative haemodilution - staged as no AKI"),
@@ -673,8 +787,9 @@ QC <- rbind(
   qc("Records where no procedure keyword matched",
      sprintf("%d (%.1f%%)", sum(d$proc_unclassified), 100 * mean(d$proc_unclassified)),
      "classified as 'Other' - listed in the audit file"),
-  qc("TAVI records", sum(d$has_tavi),
-     sprintf("TAVI_AS_VALVE = %s", TAVI_AS_VALVE)),
+  qc("TAVI records in the file", N_TAVI,
+     if (EXCLUDE_TAVI) "EXCLUDED from every figure in this report"
+     else sprintf("kept; TAVI_AS_VALVE = %s", TAVI_AS_VALVE)),
   qc("Valve-sparing root (David/Tirone) records", sum(d$has_root_spar),
      sprintf("DAVID_AS_VALVE = %s", DAVID_AS_VALVE)),
 
@@ -687,7 +802,8 @@ miss_vars <- c(age_years = "Age", sex = "Sex", elective_f = "Elective status",
                diabetes3 = "Diabetes", mort_cat = "Mortality status",
                aki_stage = "AKI stage", vent_min_all = "Ventilation time",
                icu_readm_cat = "ICU readmission", mean_vas_24h = "Mean VAS 24 h",
-               icu_los_days = "ICU length of stay", time_to_chair_min = "Time to chair")
+               icu_los_days = "ICU length of stay", time_to_chair_min = "Time to chair",
+               postop_los_days = "Post-operative hospital stay")
 for (v in names(miss_vars))
   QC <- rbind(QC, qc(paste0("   ", miss_vars[[v]], " (", v, ")"),
                      sprintf("%d (%.1f%%)", sum(is.na(d[[v]])), 100 * mean(is.na(d[[v]])))))
@@ -879,21 +995,32 @@ mort_tab <- rbind(
   row_hdr("MORTALITY - mutually exclusive categories (as coded)"),
   describe_cat(d$mort_cat, "Vital status"),
   row_hdr("MORTALITY - cumulative"),
-  row_pct("ICU mortality",                      sum(d$death_icu),  n_all),
-  row_pct("30-day mortality (ICU + post-ICU)",  sum(d$death_30d),  n_all),
-  row_pct("180-day mortality (all deaths)",     sum(d$death_180d), n_all)
+  row_pct("ICU mortality",                  sum(d$death_icu),      n_all),
+  row_pct("In-hospital mortality",          sum(d$death_hospital), n_all),
+  row_pct("30-day mortality",               sum(d$death_30d),      n_all),
+  row_pct("180-day mortality (all deaths)", sum(d$death_180d),     n_all)
 )
+if (!is.null(d$discharge_dest))
+  mort_tab <- rbind(mort_tab,
+    row_hdr("Discharge destination of the hospital admission"),
+    describe_cat(d$discharge_dest, "Ontslag bestemming"))
 
 ## --- 7.2 Acute kidney injury -------------------------------------------------
 n_aki <- sum(!is.na(d$aki_stage))
+aki_lab <- if (AKI_BASELINE == "lowest_3m")
+  "AKI stage (peak vs lowest creatinine in the 3 months before surgery)" else
+  "AKI stage (peak vs creatinine on the day before surgery)"
 aki_tab <- rbind(
   row_hdr(sprintf("ACUTE KIDNEY INJURY (assessable n = %d of %d)", n_aki, n_all)),
-  describe_cat(d$aki_stage, "AKI stage (peak vs pre-operative creatinine)"),
+  describe_cat(d$aki_stage, aki_lab),
   row_pct("AKI of any stage", sum(d$aki_any, na.rm = TRUE), n_aki),
-  describe_num(d$crea_pre,   sprintf("Pre-operative creatinine, %s", CREA_UNIT), "crea_pre", 2),
-  describe_num(d$crea_max,   sprintf("Peak creatinine, %s", CREA_UNIT),          "crea_max", 2),
-  describe_num(d$crea_delta, sprintf("Rise in creatinine, %s", CREA_UNIT),       "crea_delta", 2),
+  row_pct("Post-operative dialysis", sum(d$dialysis_postop), n_all),
+  describe_num(d$crea_base,  sprintf("Reference creatinine, %s", CREA_UNIT), "crea_base", 2),
+  describe_num(d$crea_max,   sprintf("Peak creatinine, %s", CREA_UNIT),      "crea_max", 2),
+  describe_num(d$crea_delta, sprintf("Rise above reference, %s", CREA_UNIT), "crea_delta", 2),
   describe_num(d$crea_max_lag_days, "Days from surgery to peak creatinine", "crea_max_lag_days", 0),
+  row_hdr("Sensitivity: same staging against the day-before-surgery creatinine"),
+  describe_cat(d$aki_stage_daybefore, "AKI stage, day-before baseline"),
   row_hdr(sprintf("Sensitivity: KDIGO time windows (rise <=%d d, ratio <=%d d)",
                   AKI_WINDOW_ABS_DAYS, AKI_WINDOW_RATIO_DAYS)),
   describe_cat(d$aki_stage_windowed, "AKI stage, time-windowed")
@@ -956,8 +1083,11 @@ los_tab <- rbind(
   row_hdr("LENGTH OF STAY AND MOBILISATION"),
   describe_num(d$icu_los_days, "ICU length of stay, days", "icu_los_days", 2),
   describe_num(d$icu_los_days * 24, "ICU length of stay, hours", "icu_los_hours", 1),
-  describe_num(d$hosp_los_days, "Hospital length of stay, days - NOT IN THIS EXPORT",
-               "hosp_los_days", 1),
+  describe_num(d$postop_los_days,
+               "Post-operative hospital stay, days (surgery to discharge)",
+               "postop_los_days", 1),
+  describe_num(d$ward_los_days,
+               "Ward stay after ICU discharge, days", "ward_los_days", 1),
   describe_num(d$time_to_chair_min, "Time to first sitting in chair, min", "time_to_chair_min", 0),
   describe_num(d$time_to_chair_h,   "Time to first sitting in chair, hours", "time_to_chair_h", 1),
   row_pct("Mobilised to chair within 24 h", sum(d$chair_within_24h, na.rm = TRUE),
@@ -973,20 +1103,25 @@ print_table(table2, sprintf("Table 2. Outcomes (n = %d)", n_all))
 ## --- footnotes that a reader (or reviewer) will ask for ----------------------
 n_icu_late <- sum(d$death_icu & d$icu_los_days > 30, na.rm = TRUE)
 cat("\nNotes on Table 2:\n")
-cat(" 1. 'mortaliteit' codes ONE mutually exclusive outcome per patient, so\n",
-    "    'Death <=30 days' means died within 30 days AFTER ICU discharge and\n",
-    "    'Death 31-180 days' means died later; the cumulative rows add them up.\n", sep = "")
+cat(" 1. 'mortaliteit' codes ONE mutually exclusive outcome per patient. ICU death\n",
+    "    and in-hospital death after ICU discharge together are the in-hospital\n",
+    "    deaths, and they match 'Ontslag bestemming' = Overleden exactly; the\n",
+    "    cumulative rows add the categories up.\n", sep = "")
 if (n_icu_late > 0)
-  cat("    ", n_icu_late, " ICU death(s) occurred after an ICU stay of >30 days, so the\n",
+  cat("    ", n_icu_late, " in-hospital death(s) followed a stay of >30 days, so the\n",
       "    cumulative 30-day figure is at most that many deaths too high.\n", sep = "")
-cat(" 2. AKI is staged from peak vs pre-operative creatinine only. Urine output\n",
-    "    and renal replacement therapy are not in this export, so stage 3 by RRT\n",
-    "    and any oliguric AKI are not captured - these rates are a lower bound.\n", sep = "")
+cat(" 2. AKI is staged against the lowest creatinine in the 3 months before\n",
+    "    surgery, with post-operative dialysis counted as stage 3. Urine output is\n",
+    "    still not in the export, so oliguric AKI without a creatinine rise is not\n",
+    "    captured and these rates remain a lower bound.\n", sep = "")
 cat(" 3. Ventilation time is measured from ICU admission; the row 'time from end\n",
     "    of surgery to extubation' adds the ICU-admission offset back on. Patients\n",
     "    extubated in theatre count as 0 min, not as missing.\n", sep = "")
-cat(" 4. ICU length of stay is Ontslag - Opname. A HOSPITAL length of stay is not\n",
-    "    available in this export (see the data quality report).\n", sep = "")
+cat(" 4. ICU stay is Ontslag - Opname. 'Ontslag opname' gives the hospital\n",
+    "    discharge, so the POST-OPERATIVE hospital stay can be measured; there is\n",
+    "    still no hospital admission date, so total hospital stay cannot.\n", sep = "")
+if (EXCLUDE_TAVI)
+  cat(" 5. ", N_TAVI, " TAVI procedures are excluded from every figure above.\n", sep = "")
 
 
 # =============================================================================
@@ -1033,13 +1168,15 @@ print(vas_pcia, row.names = FALSE, right = FALSE)
 
 n_pcia <- sum(d$pcia == "PCIA" & is.finite(d$mean_vas_24h))
 cat("\nINTERPRET WITH CARE:\n")
-cat(" - Only ", n_pcia, " patients with PCIA have a VAS score, against ",
+cat(" - ", n_pcia, " patients with PCIA have a VAS score, against ",
     sum(d$pcia == "No PCIA" & is.finite(d$mean_vas_24h)), " without.\n", sep = "")
-cat(" - PCIA is not randomised: it is prescribed to patients who are expected to\n",
-    "   have, or already have, more pain. A higher VAS in the PCIA group is\n",
-    "   confounding by indication, not evidence that PCIA works less well.\n", sep = "")
-cat(" - 'PCIA' is a presence-only column (16 'ja', the rest blank), so 'No PCIA'\n",
-    "   means 'not recorded as having had PCIA'.\n", sep = "")
+cat(" - PCIA is not randomised: it is given to patients expected to have, or\n",
+    "   already having, more pain. The difference between the groups therefore\n",
+    "   mixes any effect of the technique with confounding by indication, in\n",
+    "   whichever direction it happens to point, and cannot be read as an\n",
+    "   effect of PCIA.\n", sep = "")
+cat(" - 'PCIA' is a presence-only column (", sum(d$pcia == "PCIA"), " recorded 'ja', the rest blank),\n",
+    "   so 'No PCIA' means 'not recorded as having had PCIA'.\n", sep = "")
 
 ## Same comparison for the other pain endpoints, if present in the file -------
 extra_pain <- c(mean_VAS_12h = "Mean VAS, first 12 h",
@@ -1062,13 +1199,16 @@ hdr("7. SUPPLEMENTARY - mean (SD) AND median [IQR] side by side")
 NUM_VARS <- c(age_years = "Age, years", bmi = "BMI, kg/m2",
               weight_kg = "Weight, kg", height_cm = "Height, cm",
               surg_dur_min = "Duration of surgery, min",
-              crea_pre = "Pre-operative creatinine", crea_max = "Peak creatinine",
-              crea_delta = "Rise in creatinine", crea_ratio = "Peak/pre-op creatinine ratio",
+              crea_base = "Reference creatinine (lowest, 3 months)",
+              crea_pre = "Creatinine day before surgery", crea_max = "Peak creatinine",
+              crea_delta = "Rise above reference", crea_ratio = "Peak/reference ratio",
               vent_min_recorded = "Ventilation time (recorded), min",
               vent_min_all = "Ventilation time (whole cohort), min",
               time_to_extub_min = "Time surgery end to extubation, min",
               mean_vas_24h = "Mean VAS 24 h",
               icu_los_days = "ICU length of stay, days",
+              postop_los_days = "Post-operative hospital stay, days",
+              ward_los_days = "Ward stay after ICU, days",
               time_to_chair_min = "Time to chair, min",
               time_to_chair_h = "Time to chair, hours")
 NUM_VARS <- NUM_VARS[names(NUM_VARS) %in% names(d)]
